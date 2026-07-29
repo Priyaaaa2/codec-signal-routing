@@ -1,0 +1,5 @@
+*.npz
+*.pth.tar
+data/
+__pycache__/
+*.pyc
