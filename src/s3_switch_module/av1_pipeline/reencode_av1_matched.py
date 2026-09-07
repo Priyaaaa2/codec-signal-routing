@@ -53,6 +53,7 @@ def main():
 
         cmd = [
             '/usr/bin/ffmpeg', '-y', '-loglevel', 'error',
+            '-r', '25',
             '-i', h264_path,
             '-c:v', args.encoder,
             '-b:v', f'{target_kbps:.0f}k',

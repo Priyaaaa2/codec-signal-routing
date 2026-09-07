@@ -1,0 +1,155 @@
+"""
+train_switch_v2.py
+
+Retrains the switch MLP using the genuinely predictive features discovered
+today: CAR's predicted-class failure rate (leave-one-out, leak-free) and
+CAR's own confidence score, alongside the original H.264 motion features
+as secondary signals.
+
+Uses the same needs_sar convention and class-weighted loss as train_switch.py.
+"""
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+SEED = 42
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+
+FEATURES = ['predicted_class_fail_rate_loo', 'car_confidence',
+            'mv_mean', 'mv_std', 'mv_max', 'mv_sparsity',
+            'residual_energy_mean', 'av1_mv_mean' if False else 'num_frames']
+
+df = pd.read_csv('h264_switch_training_data_with_class_signal.csv')
+FEATURES = [f for f in FEATURES if f in df.columns]
+print("Using features:", FEATURES)
+
+X = df[FEATURES].values.astype(np.float32)
+y = (1 - df['car_correct'].values).astype(np.float32)   # needs_sar
+
+X_dev, X_eval, y_dev, y_eval = train_test_split(
+    X, y, test_size=0.30, stratify=y, random_state=SEED)
+X_tr, X_val, y_tr, y_val = train_test_split(
+    X_dev, y_dev, test_size=0.20, stratify=y_dev, random_state=SEED)
+
+print(f"train {len(X_tr):5d}  needs_sar={int(y_tr.sum())}")
+print(f"val   {len(X_val):5d}  needs_sar={int(y_val.sum())}")
+print(f"eval  {len(X_eval):5d}  needs_sar={int(y_eval.sum())}")
+
+scaler = StandardScaler().fit(X_tr)
+X_tr, X_val, X_eval = map(scaler.transform, (X_tr, X_val, X_eval))
+
+t = lambda a: torch.from_numpy(np.asarray(a, dtype=np.float32))
+X_tr_t, y_tr_t = t(X_tr), t(y_tr)
+X_val_t, y_val_t = t(X_val), t(y_val)
+X_eval_t, y_eval_t = t(X_eval), t(y_eval)
+
+
+class SwitchMLP(nn.Module):
+    def __init__(self, d_in, hidden=32, p_drop=0.2):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_in, hidden), nn.ReLU(), nn.Dropout(p_drop),
+            nn.Linear(hidden, hidden // 2), nn.ReLU(), nn.Dropout(p_drop),
+            nn.Linear(hidden // 2, 1))
+
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
+
+
+model = SwitchMLP(len(FEATURES))
+
+n_pos = y_tr.sum()
+n_neg = len(y_tr) - n_pos
+pos_weight = torch.tensor(n_neg / n_pos)
+print(f"pos_weight = {pos_weight.item():.2f}\n")
+
+criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+optimiser = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+
+loader = torch.utils.data.DataLoader(
+    torch.utils.data.TensorDataset(X_tr_t, y_tr_t),
+    batch_size=64, shuffle=True)
+
+
+def balanced_accuracy(probs, targets, thr):
+    pred = (probs >= thr).float()
+    pos, neg = targets == 1, targets == 0
+    rec_pos = (pred[pos] == 1).float().mean().item() if pos.any() else 0.0
+    rec_neg = (pred[neg] == 0).float().mean().item() if neg.any() else 0.0
+    return 0.5 * (rec_pos + rec_neg), rec_pos, rec_neg
+
+
+best_val, best_state, patience, since_best = -1.0, None, 30, 0
+
+for epoch in range(1, 301):
+    model.train()
+    for xb, yb in loader:
+        optimiser.zero_grad()
+        loss = criterion(model(xb), yb)
+        loss.backward()
+        optimiser.step()
+
+    model.eval()
+    with torch.no_grad():
+        val_probs = torch.sigmoid(model(X_val_t))
+    val_bal, _, _ = balanced_accuracy(val_probs, y_val_t, 0.5)
+
+    if val_bal > best_val:
+        best_val, since_best = val_bal, 0
+        best_state = {k: v.clone() for k, v in model.state_dict().items()}
+    else:
+        since_best += 1
+
+    if epoch % 25 == 0:
+        print(f"epoch {epoch:3d}  loss {loss.item():.4f}  val balanced-acc {val_bal:.4f}")
+
+    if since_best >= patience:
+        print(f"early stop at epoch {epoch}")
+        break
+
+model.load_state_dict(best_state)
+print(f"\nbest validation balanced accuracy: {best_val:.4f}")
+
+with torch.no_grad():
+    val_probs = torch.sigmoid(model(X_val_t))
+
+best_thr, best_thr_score = 0.5, -1.0
+for thr in np.arange(0.05, 0.96, 0.05):
+    score, _, _ = balanced_accuracy(val_probs, y_val_t, thr)
+    if score > best_thr_score:
+        best_thr_score, best_thr = score, thr
+print(f"selected threshold: {best_thr:.2f} (val balanced-acc {best_thr_score:.4f})")
+
+with torch.no_grad():
+    eval_probs = torch.sigmoid(model(X_eval_t))
+
+print("\n" + "=" * 62)
+print("HELD-OUT EVAL")
+print("=" * 62)
+print(f"{'thr':>5} {'bal-acc':>8} {'catch-SAR':>10} {'keep-CAR':>9} {'%to-SAR':>8}")
+for thr in [0.3, 0.4, best_thr, 0.6, 0.7]:
+    bal, rec_pos, rec_neg = balanced_accuracy(eval_probs, y_eval_t, thr)
+    frac_sar = (eval_probs >= thr).float().mean().item()
+    mark = "  <- selected" if abs(thr - best_thr) < 1e-9 else ""
+    print(f"{thr:5.2f} {bal:8.4f} {rec_pos:10.4f} {rec_neg:9.4f} {100*frac_sar:7.1f}%{mark}")
+
+bal, rec_pos, rec_neg = balanced_accuracy(eval_probs, y_eval_t, best_thr)
+frac_sar = (eval_probs >= best_thr).float().mean().item()
+car_right_when_kept = ((eval_probs < best_thr) & (y_eval_t == 0)).sum().item()
+n_kept = (eval_probs < best_thr).sum().item()
+
+print("\nRouting summary at selected threshold:")
+print(f"  clips kept on CAR : {100*(1-frac_sar):.1f}%")
+print(f"  clips sent to SAR : {100*frac_sar:.1f}%")
+print(f"  of clips kept on CAR, CAR was correct: {100*car_right_when_kept/max(1,n_kept):.1f}%")
+print(f"  (baseline: CAR correct on {100*(y_eval_t==0).float().mean():.1f}% of all clips)")
+
+torch.save({'state_dict': model.state_dict(), 'scaler_mean': scaler.mean_,
+            'scaler_scale': scaler.scale_, 'features': FEATURES,
+            'threshold': float(best_thr)}, 'switch_mlp_v2.pth')
+print("\nsaved switch_mlp_v2.pth")
